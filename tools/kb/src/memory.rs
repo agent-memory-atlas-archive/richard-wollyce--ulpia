@@ -1409,7 +1409,7 @@ impl Memory {
     pub fn classifier(&self) -> crate::classify::Classifier {
         for root in &self.opened {
             if let (_, _, Some(cmd)) = manifest_full(&root.join(MANIFEST)) {
-                return crate::classify::Classifier::Command(cmd);
+                return crate::classify::Classifier::from_manifest(&cmd);
             }
         }
         crate::classify::Classifier::None
@@ -1460,7 +1460,7 @@ impl Memory {
     fn manifest_command(&self, key: &str) -> crate::classify::Classifier {
         for root in &self.opened {
             if let Some(cmd) = manifest_key(&root.join(MANIFEST), key) {
-                return crate::classify::Classifier::Command(cmd);
+                return crate::classify::Classifier::from_manifest(&cmd);
             }
         }
         crate::classify::Classifier::None

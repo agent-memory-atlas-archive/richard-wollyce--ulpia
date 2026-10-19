@@ -35,8 +35,10 @@
 //! deterministic choice, so **the fleet never stops answering because a model was
 //! unavailable.**
 
-use std::io::Write;
+use std::io::{Read, Write};
+use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::memory::{AgentChoice, Memory};
 use crate::retrieve::Retrieved;
@@ -48,6 +50,22 @@ pub enum Classifier {
     None,
     /// A command that reads the dossier on stdin and writes the verdict on stdout.
     Command(String),
+    /// A direct HTTP endpoint (e.g. resident llama-server on localhost:4115).
+    Http(String),
+}
+
+impl Classifier {
+    /// Parses a manifest classifier declaration into a Command or direct Http endpoint.
+    pub fn from_manifest(cmd: &str) -> Self {
+        let trimmed = cmd.trim();
+        if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+            Classifier::Http(trimmed.to_string())
+        } else if !trimmed.is_empty() {
+            Classifier::Command(trimmed.to_string())
+        } else {
+            Classifier::None
+        }
+    }
 }
 
 /// What the classifier concluded, and the reason a caller can show a person.
@@ -717,30 +735,164 @@ pub fn resolve(root: &Path, cmd: &str) -> Option<(PathBuf, Vec<String>)> {
 /// the deterministic choice and a fleet that stops routing when a model is unavailable is
 /// worse than one that routes the old way.
 pub fn run(classifier: &Classifier, root: &Path, dossier: &str, roster: &[String]) -> Option<Verdict> {
-    let Classifier::Command(cmd) = classifier else { return None };
+    match classifier {
+        Classifier::None => None,
+        Classifier::Http(url) => run_http(url, dossier, roster),
+        Classifier::Command(cmd) => {
+            // Quotes are honoured, because the first thing a Windows user types is a path with a
+            // space in it. The command is resolved against the fleet root before the working directory
+            // stops being the root. An absolute path or a bare name on PATH passes through untouched.
+            let (resolved, args) = resolve(root, cmd)?;
 
-    // Quotes are honoured, because the first thing a Windows user types is a path with a
-    // space in it. The command is resolved against the fleet root before the working directory
-    // stops being the root. An absolute path or a bare name on PATH passes through untouched.
-    let (resolved, args) = resolve(root, cmd)?;
+            let mut child = crate::base::quiet(&resolved.to_string_lossy())
+                .args(&args)
+                .current_dir(scratch_cwd(root))
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .ok()?;
 
-    let mut child = crate::base::quiet(&resolved.to_string_lossy())
-        .args(&args)
-        .current_dir(scratch_cwd(root))
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .ok()?;
+            // The dossier goes on stdin, never in the argument list: it contains the user's
+            // message, and an argument list is a quoting surface. Same reason the desk does it.
+            child.stdin.take()?.write_all(dossier.as_bytes()).ok()?;
 
-    // The dossier goes on stdin, never in the argument list: it contains the user's
-    // message, and an argument list is a quoting surface. Same reason the desk does it.
-    child.stdin.take()?.write_all(dossier.as_bytes()).ok()?;
-
-    let out = child.wait_with_output().ok()?;
-    let reply = String::from_utf8_lossy(&out.stdout);
-    parse(&reply, roster)
+            let out = child.wait_with_output().ok()?;
+            let reply = String::from_utf8_lossy(&out.stdout);
+            parse(&reply, roster)
+        }
+    }
 }
+
+/// Sends the dossier to an HTTP endpoint (such as a resident llama.cpp server)
+/// with a dynamically generated GBNF grammar for type-safe structured output.
+pub fn run_http(url: &str, dossier: &str, roster: &[String]) -> Option<Verdict> {
+    let trimmed = url.trim();
+    let without_scheme = trimmed
+        .strip_prefix("http://")
+        .or_else(|| trimmed.strip_prefix("https://"))
+        .unwrap_or(trimmed);
+
+    let (host_port, path) = match without_scheme.split_once('/') {
+        Some((hp, p)) => (hp, format!("/{p}")),
+        None => (without_scheme, "/v1/chat/completions".to_string()),
+    };
+
+    let (host, port) = match host_port.split_once(':') {
+        Some((h, p)) => (h, p.parse::<u16>().ok()?),
+        None => (host_port, 80),
+    };
+
+    // Build closed GBNF grammar strictly bounding OWNER to roster names + none,
+    // and COVERAGE to covered | adjacent | uncovered.
+    let owner_options = roster
+        .iter()
+        .map(|name| format!("\"{}\"", name.to_lowercase()))
+        .chain(std::iter::once("\"none\"".to_string()))
+        .collect::<Vec<_>>()
+        .join(" | ");
+
+    let grammar = format!(
+        "root ::= \"SUBJECT: \" subject \"\\nREASON: \" reason \"\\nCOVERAGE: \" coverage \"\\nOWNER: \" owner \"\\n\"\n\
+         subject ::= [^\\n]{{3,60}}\n\
+         reason ::= [^\\n]{{5,180}}\n\
+         coverage ::= \"covered\" | \"adjacent\" | \"uncovered\"\n\
+         owner ::= {}\n",
+        owner_options
+    );
+
+    // Build request payload using Ulpia's zero-dependency json::Value
+    let mut root_val = crate::json::Value::obj();
+    let mut msg = crate::json::Value::obj();
+    msg.set("role", crate::json::Value::Str("user".into()));
+    msg.set("content", crate::json::Value::Str(dossier.to_string()));
+    root_val.set("messages", crate::json::Value::Arr(vec![msg]));
+    root_val.set("temperature", crate::json::Value::Num(0.0));
+    root_val.set("max_tokens", crate::json::Value::Num(160.0));
+    root_val.set("grammar", crate::json::Value::Str(grammar));
+
+    let mut kwargs = crate::json::Value::obj();
+    kwargs.set("enable_thinking", crate::json::Value::Bool(false));
+    root_val.set("chat_template_kwargs", kwargs);
+
+    let body = root_val.to_string();
+
+    // Fast connection timeout: if server is down, fail fast into fallback in <= 250ms
+    let addr = format!("{}:{}", host, port);
+    let socket_addr = addr.to_socket_addrs().ok()?.next()?;
+    let mut stream = TcpStream::connect_timeout(&socket_addr, Duration::from_millis(250)).ok()?;
+    stream.set_read_timeout(Some(Duration::from_millis(4000))).ok()?;
+    stream.set_write_timeout(Some(Duration::from_millis(1000))).ok()?;
+
+    let request = format!(
+        "POST {} HTTP/1.1\r\n\
+         Host: {}:{}\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\
+         \r\n\
+         {}",
+        path, host, port, body.len(), body
+    );
+    stream.write_all(request.as_bytes()).ok()?;
+
+    let mut response_bytes = Vec::new();
+    stream.read_to_end(&mut response_bytes).ok()?;
+    let response = String::from_utf8_lossy(&response_bytes);
+
+    let (headers, raw_body) = if let Some(parts) = response.split_once("\r\n\r\n") {
+        parts
+    } else if let Some(parts) = response.split_once("\n\n") {
+        parts
+    } else {
+        return None;
+    };
+
+    let first_line = headers.lines().next().unwrap_or("");
+    if !first_line.contains(" 200") {
+        return None;
+    }
+
+    let body_str = if headers.to_ascii_lowercase().contains("transfer-encoding: chunked") {
+        decode_chunked(raw_body)
+    } else {
+        raw_body.to_string()
+    };
+
+    let json_val = crate::json::parse(body_str.trim()).ok()?;
+    let choices = match json_val.get("choices") {
+        Some(crate::json::Value::Arr(arr)) => arr,
+        _ => return None,
+    };
+    let message = choices.first()?.get("message")?;
+    let content = match message.get("content") {
+        Some(crate::json::Value::Str(s)) => s,
+        _ => return None,
+    };
+
+    parse(content, roster)
+}
+
+fn decode_chunked(raw: &str) -> String {
+    let mut out = String::new();
+    let mut cur = raw;
+    while let Some((size_line, rest)) = cur.split_once("\r\n") {
+        let size_str = size_line.trim().split(';').next().unwrap_or("").trim();
+        let size = usize::from_str_radix(size_str, 16).unwrap_or(0);
+        if size == 0 {
+            break;
+        }
+        if rest.len() < size {
+            out.push_str(rest);
+            break;
+        }
+        out.push_str(&rest[..size]);
+        let after = &rest[size..];
+        cur = after.strip_prefix("\r\n").unwrap_or(after);
+    }
+    out
+}
+
 
 /// The line a surface shows when the fleet has no owner for a subject.
 ///
@@ -1115,4 +1267,28 @@ mod tests {
         let c = Classifier::Command("this-binary-does-not-exist-4114".into());
         assert!(run(&c, Path::new("."), "x", &roster()).is_none());
     }
+
+    #[test]
+    fn an_http_endpoint_that_is_down_falls_back_fast_rather_than_failing() {
+        let c = Classifier::Http("http://127.0.0.1:59999/v1/chat/completions".into());
+        assert!(run(&c, Path::new("."), "x", &roster()).is_none());
+    }
+
+    #[test]
+    fn classifier_from_manifest_parses_http_and_command() {
+        assert_eq!(
+            Classifier::from_manifest("http://127.0.0.1:4115"),
+            Classifier::Http("http://127.0.0.1:4115".into())
+        );
+        assert_eq!(
+            Classifier::from_manifest("http://localhost:4115/v1/chat/completions"),
+            Classifier::Http("http://localhost:4115/v1/chat/completions".into())
+        );
+        assert_eq!(
+            Classifier::from_manifest("tools/classify-local.cmd"),
+            Classifier::Command("tools/classify-local.cmd".into())
+        );
+        assert_eq!(Classifier::from_manifest("   "), Classifier::None);
+    }
 }
+

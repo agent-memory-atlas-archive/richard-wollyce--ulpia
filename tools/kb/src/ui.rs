@@ -173,6 +173,7 @@ fn handle(
             // string: the thread outlives this borrow of `state`.
             let runtime = match state.memory.chat() {
                 crate::classify::Classifier::Command(cmd) => Some(cmd),
+                crate::classify::Classifier::Http(url) => Some(url),
                 crate::classify::Classifier::None => None,
             };
             let stream = stream.try_clone()?;

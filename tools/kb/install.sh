@@ -93,6 +93,18 @@ if ! cp "$SRC" "$DEST"; then
 fi
 chmod +x "$DEST"
 
+# Cross-platform compatibility for MCP configurations:
+# On Windows, libuv/Node and CreateProcess require the `.exe` extension to execute a binary.
+# On Unix (macOS, Linux), the kernel executes Mach-O/ELF binaries regardless of extension.
+# By ensuring both `kb` and `kb.exe` exist in `tools/kb/bin/`, `.mcp.json` referencing
+# `./tools/kb/bin/kb.exe` works out-of-the-box across Windows, macOS, and Linux without wrappers.
+if [ "$NAME" = "kb" ]; then
+  ln -sf kb "$DEST_DIR/kb.exe" 2>/dev/null || cp -p "$DEST" "$DEST_DIR/kb.exe"
+  chmod +x "$DEST_DIR/kb.exe" 2>/dev/null || true
+elif [ "$NAME" = "kb.exe" ]; then
+  cp -p "$DEST" "$DEST_DIR/kb" 2>/dev/null || true
+fi
+
 # The old file is only removable once nothing is executing it. A leftover here is not a
 # failure, it is the honest signal that a `kb serve` from an open session is still running
 # the previous build and will pick the new one up when that session ends.

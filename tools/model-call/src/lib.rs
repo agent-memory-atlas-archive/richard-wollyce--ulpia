@@ -147,41 +147,88 @@ pub fn extract(provider: &str, parsed: &Value) -> Result<String, String> {
     }
 }
 
-/// Make the call. Every failure is a message a person can act on, never a panic.
+/// Make the call with retries on transient network and server errors.
+/// Every failure is a message a person can act on, never a panic.
 pub fn call(provider: &str, model: &str, key: &str, prompt: &str) -> Result<String, String> {
     let agent = ureq::Agent::config_builder()
         .timeout_global(Some(std::time::Duration::from_secs(TIMEOUT_SECONDS)))
+        .http_status_as_error(false)
         .build()
         .new_agent();
 
-    let mut request = agent.post(&endpoint(provider, model));
-    for (name, value) in headers(provider, key) {
-        request = request.header(name, &value);
-    }
+    let max_attempts = 5;
+    let mut last_err = String::new();
 
-    let parsed: Value = match request.send_json(body(provider, model, prompt)) {
-        Ok(mut response) => response
-            .body_mut()
-            .read_json()
-            .map_err(|e| format!("{provider} sent something that is not JSON: {e}"))?,
-        Err(ureq::Error::StatusCode(code)) => {
-            return Err(format!("HTTP {code} from {provider}"));
+    for attempt in 1..=max_attempts {
+        let mut request = agent.post(&endpoint(provider, model));
+        for (name, value) in headers(provider, key) {
+            request = request.header(name, &value);
         }
-        Err(e) => return Err(format!("could not reach {provider}: {e}")),
-    };
 
-    // Checked on EVERY response, not only the non-2xx ones. OpenRouter commits headers
-    // before the model produces a token, so a mid generation failure arrives as a 200 with
-    // an error body and no client raises anything at all.
-    if !parsed["error"].is_null() {
-        let message = parsed["error"]["message"]
-            .as_str()
-            .map(str::to_string)
-            .unwrap_or_else(|| parsed["error"].to_string());
-        return Err(format!("{provider} returned an error: {}", truncate(&message, 300)));
+        let mut response = match request.send_json(body(provider, model, prompt)) {
+            Ok(res) => res,
+            Err(e) => {
+                let err_msg = format!("could not reach {provider}: {e}");
+                if attempt < max_attempts {
+                    std::thread::sleep(std::time::Duration::from_millis(600 * (1 << (attempt - 1))));
+                    last_err = err_msg;
+                    continue;
+                }
+                return Err(err_msg);
+            }
+        };
+
+        let status = response.status().as_u16();
+        let body_str = match response.body_mut().read_to_string() {
+            Ok(s) => s,
+            Err(e) => return Err(format!("{provider} read error: {e}")),
+        };
+        let parsed: Value = serde_json::from_str(&body_str).unwrap_or(Value::Null);
+
+        if status != 200 {
+            let message = if !parsed["error"]["message"].is_null() {
+                parsed["error"]["message"].as_str().unwrap_or("").to_string()
+            } else if !body_str.is_empty() {
+                body_str.clone()
+            } else {
+                format!("HTTP {status}")
+            };
+            let err_msg = format!("{provider} returned HTTP {status}: {}", truncate(&message, 300));
+            if (status == 503 || status == 429 || status >= 500) && attempt < max_attempts {
+                let backoff = std::time::Duration::from_millis(
+                    if status == 429 { 3000 * attempt as u64 } else { 600 * (1 << (attempt - 1)) }
+                );
+                std::thread::sleep(backoff);
+                last_err = err_msg;
+                continue;
+            }
+            return Err(err_msg);
+        }
+
+        // Checked on EVERY response, not only the non-2xx ones. OpenRouter commits headers
+        // before the model produces a token, so a mid generation failure arrives as a 200 with
+        // an error body and no client raises anything at all.
+        if !parsed["error"].is_null() {
+            let message = parsed["error"]["message"]
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| parsed["error"].to_string());
+            let err_msg = format!("{provider} returned an error: {}", truncate(&message, 300));
+            if (message.contains("overloaded") || message.contains("503") || message.contains("rate limit") || message.contains("429")) && attempt < max_attempts {
+                let backoff = std::time::Duration::from_millis(
+                    if message.contains("429") || message.contains("rate limit") { 3000 * attempt as u64 } else { 600 * (1 << (attempt - 1)) }
+                );
+                std::thread::sleep(backoff);
+                last_err = err_msg;
+                continue;
+            }
+            return Err(err_msg);
+        }
+
+        return extract(provider, &parsed);
     }
 
-    extract(provider, &parsed)
+    Err(last_err)
 }
 
 fn truncate(text: &str, limit: usize) -> String {
