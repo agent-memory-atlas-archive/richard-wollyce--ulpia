@@ -594,10 +594,10 @@ Registering it with Claude Code, project scope, from `.mcp.json` at the reposito
 ```json
 {
   "mcpServers": {
-    "zed-memory": {
+    "vesta": {
       "type": "stdio",
-      "command": "${CLAUDE_PROJECT_DIR}/tools/kb/bin/kb.exe",
-      "args": ["serve", "${CLAUDE_PROJECT_DIR}"]
+      "command": "./tools/kb/bin/kb.exe",
+      "args": ["serve", "."]
     }
   }
 }
@@ -607,7 +607,8 @@ Registering it with Claude Code, project scope, from `.mcp.json` at the reposito
 mapped for the whole life of a session, so the path named here is a file some process is
 holding open. Name the build directory and the next `cargo build --release` fails its own
 final step on Windows, because a running image cannot have its file removed. Build into
-`target/`, which nothing maps, then `sh tools/kb/install.sh` to place it in `bin/`.
+`target/`, which nothing maps, then run `sh tools/kb/install.sh` (or `tools\kb\install.bat` on Windows)
+to place it in `bin/`.
 
 For all three agents at once, user scope, which stays out of git:
 
@@ -879,19 +880,19 @@ convention writes `[[file-name]]` in backticks and those are examples, not refer
 
 ## Build and install
 
-```
+```bash
 cargo test
 cargo build --release
-sh install.sh
+sh install.sh       # On Windows: install.bat
 ```
 
-Cargo writes the binary into `target/release/` and `install.sh` copies it to `bin/`, which
-is the installed path and the one `.mcp.json` and the hooks under `.claude/` name. Both
-directories are gitignored, and they are two directories rather than one because a running
-`kb serve` maps the installed file: on Windows a mapped file cannot be removed, and cargo
-installs by remove-then-hardlink, so a build directory that doubles as an install directory
+Cargo writes the binary into `target/release/` and `install.sh` (or `install.bat` on Windows)
+copies it to `bin/`, which is the installed path and the one `.mcp.json` and the hooks under
+`.claude/` name. Both directories are gitignored, and they are two directories rather than one
+because a running `kb serve` maps the installed file: on Windows a mapped file cannot be removed,
+and cargo installs by remove-then-hardlink, so a build directory that doubles as an install directory
 makes `cargo build --release` fail its own last step whenever a session is open. The
-installer moves the old file aside instead of writing over it, which is the operation
+installer moves the old file aside (`rename-aside`) instead of writing over it, which is the operation
 Windows does allow on a mapped file, and the running server keeps executing the image it
 already has until it exits.
 

@@ -40,8 +40,11 @@ place in an ordinary day:
   English note when its keys say it should.
 - **Keep several specialists and get the right one.** `kb boot` scores a message across
   every base, decomposes compound multi-domain questions into atomic sub-queries, and
-  hands the conversation to the one that owns the subject, so the architect does not end up
-  answering a security question.
+  hands the conversation to the one that owns the subject. Routing supports both a **resident
+  local HTTP classifier** (e.g. `llama-server` on `http://127.0.0.1:4115/...` constrained by
+  dynamic GBNF grammars for zero-hallucination structured verdicts) and **command shims**
+  with exponential backoff retries. If the classifier is offline, `kb boot` falls back in
+  under a millisecond to deterministic keyword scoring—**the fleet never stops routing.**
 - **Get more than one specialist on the work that needs it.** When a decomposed query or
   router verdict crosses domains, Vesta seats the primary agent as owner and convenes a panel.
   `kb panel` boots each reviewer from its own constitution, enforces constitutional
@@ -196,16 +199,22 @@ Requires Rust. One dependency, no build scripts of our own; that dependency comp
 bundled SQLite, so a fresh clone needs a C toolchain (MSVC Build Tools on Windows).
 No network at runtime.
 
-```
+```bash
 git clone https://github.com/richard-wollyce/ulpia && cd ulpia
 cargo build --release --manifest-path tools/kb/Cargo.toml
+
+# On macOS and Linux:
 sh tools/kb/install.sh
+
+# On Windows (Command Prompt or PowerShell):
+tools\kb\install.bat
 ```
 
 Cargo writes the binary into `tools/kb/target/release/`, and the install step copies it to
-**`tools/kb/bin/kb`** (`kb.exe` on Windows), which is the path every tracked config file in
-this repository names: [`.mcp.json`](.mcp.json) and the hooks under `.claude/`. Put that on
-your PATH or call it by that path in everything below.
+**`tools/kb/bin/kb`** (and links/copies `kb.exe` beside it). This dual-name parity ensures that
+the repository's tracked configuration files—including [`.mcp.json`](.mcp.json) and the hooks
+under `.claude/`—execute seamlessly across **Windows, macOS, and Linux** without any manual path adjustments.
+Put `tools/kb/bin` on your PATH or call it by that path in everything below.
 
 **The two directories are separate on purpose and the reason is mechanical.** `.mcp.json`
 maps `kb serve` for the whole life of a session, so whatever path it names is held open by
@@ -213,8 +222,9 @@ a running process, and on Windows a running image cannot have its file removed w
 installs its artifact by remove-then-hardlink. When both were the same file,
 `cargo build --release` compiled a fix and then died on its own final step with
 `failed to remove file ... (os error 5)`. `tools/kb/bin/` is gitignored like `target/`, so
-each clone fills it once from its own build; the install script moves the old file aside
-rather than writing over it, which is the one operation Windows allows on a mapped file.
+each clone fills it once from its own build; both `install.sh` and `install.bat` move the old
+file aside (`rename-aside`) rather than writing over it, which is the one operation Windows
+allows on a mapped file.
 
 Building it yourself is the honest default for a tool that reads your notes, and it is not
 the only way. Tagged releases carry `kb-linux-x64`, `kb-windows-x64.exe`, `kb-macos-arm64`
@@ -590,20 +600,43 @@ noise and can never remove signal.
 
 ## Use it from Claude, or anything else that speaks MCP
 
-```
+```bash
 kb serve .
 ```
 
-Five read-only tools over stdio: `kb_route`, `kb_retrieve`, `kb_remember`, `kb_fleet` and
-`kb_list`. The first four answer a question; `kb_list` answers what exists, filtered by
-facet, with nothing ranked and no verdict, because a filter has no ranking problem to
-solve. **None of them writes**, and that is a decision rather than an omission: a write
-tool reached by a model is a different security surface and gets built deliberately.
+`kb serve` speaks the Model Context Protocol (MCP) over stdio as **Vesta**, the keeper of the fleet.
+It exposes five read-only tools to any MCP-capable client:
 
-The server speaks both the current stateless revision and the older handshake era, and
-answers `initialize` when asked without ever requiring it.
+- **`kb_route(question, top)`**: Ask which files a question should open. Returns ranked file paths, matched keywords, and an `EVIDENCE` line with score, floor, and verdict.
+- **`kb_retrieve(question, top)`**: Returns the matching passages themselves with heading hierarchy and provenance.
+- **`kb_remember(claim)`**: Measures a claim against the base and proposes `ADD`, `UPDATE`, or `NOOP` with containment evidence.
+- **`kb_fleet`**: Reads fleet identity and the roster of all member agents and their roles.
+- **`kb_list(base, folder, kind, stage, provenance, limit)`**: Facet-based inventory query (unranked, zero scoring).
 
-For Claude Desktop, in `claude_desktop_config.json`:
+**None of them writes to the knowledge base.** That is a design decision rather than an omission: a write tool reached by a model is a distinct security surface and gets built deliberately.
+
+The server speaks both the current stateless revision and the older handshake era, answering `initialize` when asked without requiring it.
+
+### Project-level integration (Claude Code)
+
+This repository includes a pre-configured [`.mcp.json`](.mcp.json) at the root:
+
+```json
+{
+  "mcpServers": {
+    "vesta": {
+      "command": "./tools/kb/bin/kb.exe",
+      "args": ["serve", "."]
+    }
+  }
+}
+```
+
+*Runs natively across Windows, macOS, and Linux out of the box once built and installed with `tools/kb/install.sh` or `tools/kb/install.bat`.*
+
+### User-level integration (Claude Desktop)
+
+In `claude_desktop_config.json`:
 
 ```json
 {
@@ -615,12 +648,7 @@ For Claude Desktop, in `claude_desktop_config.json`:
   }
 }
 ```
-
-**There is deliberately no write tool.** `kb_remember` measures a claim against what the
-base already says and proposes ADD, UPDATE or NOOP with its evidence. It writes nothing
-and decides nothing. A write tool reachable by a model is a different security surface
-and gets built deliberately, not as an afterthought while the retrieval side is still
-warm.
+*(On Windows, specify the full path to `kb.exe`).*
 
 ---
 
